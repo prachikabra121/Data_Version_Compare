@@ -1,6 +1,6 @@
 # Version Comparison Tool
 
-**Store Matching & Comparison Tool**  
+**Version Comparison Tool**  
 A lightweight Python + Streamlit application to compare OLD and NEW store CSV files.  
 It matches stores intelligently using fuzzy address comparison, store IDs, phone numbers, and geo-coordinates.
 
