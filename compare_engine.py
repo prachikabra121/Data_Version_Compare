@@ -12,10 +12,6 @@ Features:
 - Keeps helper functions for CLI/batch usage (run_batch, safe_write_csv) if you want to use them,
   but the UI wrappers never write to disk.
 - No code runs on import.
-
-Usage:
-    from compare_engine import compare_pair_df, compare_uploaded_files
-    df = compare_uploaded_files(uploaded_old, uploaded_new)   # e.g., Streamlit file objects
 """
 import math
 import re
@@ -363,6 +359,10 @@ def map_new_to_old_schema(new_df: pd.DataFrame, old_cols_ordered: List[str]) -> 
     """
     Rename NEW columns to OLD names case-insensitively; add blanks for missing.
     Additionally: if OLD has multiple name-like columns and NEW has one, fill missing old name cols.
+    Special handling for 'dba' column:
+      - If OLD has a `dba` column and NEW does NOT have any dba-like column, do NOT populate OLD.dba
+        from a generic NEW.name column. This preserves original DBA values in OLD.
+      - If NEW contains an explicit dba-like column, it will be used to populate OLD.dba when empty.
     Also: map address1/address_1 -> old address column when possible.
     """
     new_lower = {c.lower(): c for c in new_df.columns}
@@ -401,15 +401,43 @@ def map_new_to_old_schema(new_df: pd.DataFrame, old_cols_ordered: List[str]) -> 
         if new_addr_col:
             new2[old_addr_col] = new_df[new_addr_col].fillna("").astype(str)
 
-    # If OLD has multiple name-like columns and NEW has at least one name column,
-    # then copy NEW's available name into any empty OLD name columns so matching/merge is straightforward.
+    # NAME-like filling with special dba handling
     old_name_cols = [c for c in old_cols_ordered if re.sub(r"[\s_]+", "", c.lower()) in {re.sub(r"[\s_]+", "", n) for n in NAME_CANDS}]
-    new_name_col = find_ci(new_df, NAME_CANDS)
-    if old_name_cols and new_name_col:
-        for col in old_name_cols:
-            if col in new2.columns:
-                if new2[col].eq("").all():
-                    new2[col] = new_df[new_name_col].fillna("").astype(str)
+    # find a generic new name (first best) and also list all name-like cols in new
+    new_name_col_generic = find_ci(new_df, NAME_CANDS)
+    new_name_cols_all = find_all_ci(new_df, NAME_CANDS)
+
+    for col in old_name_cols:
+        # token for this old name column (e.g., 'dba', 'storename' -> tokens without underscores/spaces)
+        old_tok = re.sub(r"[\s_]+", "", col.lower())
+
+        # If the old column is 'dba', only populate it from NEW if NEW has an explicit dba column.
+        if old_tok == "dba":
+            dba_in_new = None
+            for nc in new_name_cols_all:
+                if re.sub(r"[\s_]+", "", nc.lower()) == "dba":
+                    dba_in_new = nc
+                    break
+            if dba_in_new:
+                if col in new2 and new2[col].eq("").all():
+                    new2[col] = new_df[dba_in_new].fillna("").astype(str)
+            else:
+                # intentionally leave OLD.dba alone (do not populate from generic name)
+                continue
+        else:
+            # If new has a column matching same token (e.g., old 'store_name' and new 'store_name'), use that
+            same_token_new = None
+            for nc in new_name_cols_all:
+                if re.sub(r"[\s_]+", "", nc.lower()) == old_tok:
+                    same_token_new = nc
+                    break
+            if same_token_new:
+                if col in new2 and new2[col].eq("").all():
+                    new2[col] = new_df[same_token_new].fillna("").astype(str)
+            else:
+                # fallback: if generic new name exists (like 'name' or 'store_name'), use it for non-dba old name cols
+                if new_name_col_generic and col in new2 and new2[col].eq("").all():
+                    new2[col] = new_df[new_name_col_generic].fillna("").astype(str)
 
     return new2[old_cols_ordered]
 
