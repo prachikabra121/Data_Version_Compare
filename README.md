@@ -107,5 +107,5 @@ MIT License — free to modify and use.
 
 ---
 
-**Author:** AnalyticsWithAnand  
-**Tagline:** Let the Data Do the Talking...
+**Author:** Prachi Kabra 
+
