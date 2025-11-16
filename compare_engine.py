@@ -44,12 +44,23 @@ ENCODING = "utf-8-sig"
 
 # Never overwrite these from NEW on matched rows:
 DO_NOT_OVERWRITE = {"city", "state", "zip", "zipcode", "zip_code", "postal", "postalcode", "postal_code"}
+# === Header aliasing: map canonical token -> list of alternate header names users sometimes send ===
+# tokens are case-insensitive and underscore/space-insensitive.
+HEADER_ALIASES = {
+    # map canonical names (as lowercase canonical tokens) to common variants seen in NEW files
+    "store_name": ["property_name", "property", "propertyname", "storename", "location_name","PROPERTY_NAME"],
+    "address": ["address1", "addr1", "addr_line", "street_address", "streetaddress","ADDRESS"],
+    "latitude": ["lat"],
+    "longitude": ["lon", "lng", "long"],
+    "phone": ["phone_number", "telephone", "tel"],
+    # add others as you see them
+}
 
 # Column candidate names (case-insensitive)
 ADDR_CANDS  = [
     "address","address1","address_1","address line 1","address line1","addr","addr1",
     "street","street1","address_line","address_line1","address_line_1","street_address",
-    "streetaddress","line1","address2","address_2","address line 2","address_line_2"
+    "streetaddress","line1","address2","address_2","address line 2","address_line_2","ADDRESS"
 ]
 CITY_CANDS  = ["city","town"]
 STATE_CANDS = ["state","province","region","state_code","st"]
@@ -64,82 +75,27 @@ ID_CANDS = [
 ]
 
 # Date tokens in filenames
-DATE_TOKEN_FINDER = re.compile(r"(\d{2}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4})")
-# Brand = prefix before first underscore (e.g., "taco_bell_*" -> "taco")
-BRAND_RE  = re.compile(r"^([A-Za-z0-9]+)_")
+DATE_TOKEN_FINDER = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4}|\d{2}-\d{2}-\d{2})")
+
+BRAND_RE = re.compile(r"^([A-Za-z0-9_-]+).*")
 
 # ===============================
-# Robust CSV Reader / Writer
+# Utilities & simple file readers
 # ===============================
-def read_csv_robust(path: Path, encoding: str = ENCODING) -> pd.DataFrame:
-    """
-    Robust CSV reader with multiple fallbacks. Returns DataFrame with string dtype
-    and keep_default_na=False (so blanks stay as empty strings).
-    """
-    base = dict(dtype=str, keep_default_na=False)
-    attempts = [
-        dict(encoding=encoding),
-        dict(encoding=encoding, engine="python", sep=None),
-        dict(encoding=encoding, engine="python", sep=None, on_bad_lines="skip"),
-        dict(encoding=encoding, engine="python", sep=",", quotechar='"', escapechar="\\", on_bad_lines="skip"),
-    ]
-    for enc in ("utf-16", "utf-16le", "latin1"):
-        attempts.append(dict(encoding=enc, engine="python", sep=None, on_bad_lines="skip"))
-
-    last_err = None
-    for kw in attempts:
-        try:
-            return pd.read_csv(path, **base, **kw)
-        except TypeError as te:
-            # older pandas may not accept on_bad_lines; try older args
-            if "on_bad_lines" in kw:
-                kw2 = kw.copy()
-                kw2.pop("on_bad_lines", None)
-                kw2["error_bad_lines"] = False  # older pandas compat
-                kw2["warn_bad_lines"] = True
-                try:
-                    return pd.read_csv(path, **base, **kw2)
-                except Exception as e:
-                    last_err = e
-            else:
-                last_err = te
-        except Exception as e:
-            last_err = e
-    raise last_err
-
-def _safe_stem(stem: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", stem)
-
-def safe_write_csv(df: pd.DataFrame, out_path: Path, encoding: str = ENCODING):
-    """
-    Attempts to save CSV, with fallback names if target busy. Creates OUT_DIR if missing.
-    (This is a helper for CLI/batch usage only — UI wrappers do not call this.)
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+def read_csv_robust(p: Path) -> pd.DataFrame:
+    # try a few encodings / engine fallbacks if needed
     try:
-        df.to_csv(out_path, index=False, encoding=encoding)
-        return out_path
-    except PermissionError:
-        pass
-    except OSError:
-        spath = out_path.parent / f"{_safe_stem(out_path.stem)}{out_path.suffix}"
+        return pd.read_csv(p, dtype=str, keep_default_na=False, encoding=ENCODING)
+    except Exception:
         try:
-            df.to_csv(spath, index=False, encoding=encoding)
-            return spath
+            return pd.read_csv(p, dtype=str, keep_default_na=False, encoding="utf-8")
         except Exception:
-            out_path = spath
+            return pd.read_csv(p, dtype=str, keep_default_na=False, encoding="latin-1")
 
-    base = _safe_stem(out_path.stem)
-    suffix = out_path.suffix
-    parent = out_path.parent
-    n = 1
-    while True:
-        candidate = parent / f"{base}_{n}{suffix}"
-        try:
-            df.to_csv(candidate, index=False, encoding=encoding)
-            return candidate
-        except (PermissionError, OSError):
-            n += 1
+def list_csvs(d: Path) -> List[Path]:
+    if not d.exists() or not d.is_dir():
+        return []
+    return sorted(list(d.glob("*.csv")))
 
 # ===============================
 # Filename helpers
@@ -175,99 +131,8 @@ def extract_brand(p: Path) -> str:
     return m.group(1).lower() if m else p.stem.lower()
 
 # ===============================
-# Dataframe helpers
+# Core helpers (text, addr, phone, geo)
 # ===============================
-def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-def _token(s: str) -> str:
-    return re.sub(r"[\s_]+", "", s.lower())
-
-def find_ci(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    low = {c.lower(): c for c in df.columns}
-    tok = {_token(c): c for c in df.columns}
-    for name in candidates:
-        nlow = name.lower()
-        if nlow in low: return low[nlow]
-        ntok = _token(name)
-        if ntok in tok: return tok[ntok]
-    return None
-
-def find_all_ci(df: pd.DataFrame, candidates: List[str]) -> List[str]:
-    found = []
-    tok_map = {_token(c): c for c in df.columns}
-    cols_lower = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        n = cand.lower()
-        if n in cols_lower:
-            for c in df.columns:
-                if c.lower() == n:
-                    found.append(c)
-        else:
-            t = re.sub(r"[\s_]+", "", cand.lower())
-            if t in tok_map:
-                found.append(tok_map[t])
-    # keep order and unique
-    seen = set(); out = []
-    for c in found:
-        if c not in seen:
-            out.append(c); seen.add(c)
-    return out
-
-def detect_lat_lon_optional(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
-    if "LATITUDE" in df.columns and "LONGITUDE" in df.columns:
-        return "LATITUDE", "LONGITUDE"
-    low = {c.lower(): c for c in df.columns}
-    lat = low.get("latitude") or low.get("lat")
-    lon = low.get("longitude") or low.get("lon") or low.get("lng") or low.get("long")
-    return lat, lon
-
-def to_float(s):
-    return pd.to_numeric(s, errors="coerce")
-
-# ===============================
-# Phone normalization & compare
-# ===============================
-def norm_phone(s: str) -> str:
-    if s is None: return ""
-    return re.sub(r"\D", "", str(s))
-
-def phone_matches(a: str, b: str) -> bool:
-    d1, d2 = norm_phone(a), norm_phone(b)
-    if not d1 or not d2: return False
-    if d1 == d2: return True
-    return len(d1) >= 7 and len(d2) >= 7 and d1[-7:] == d2[-7:]
-
-# ===============================
-# Geo + Text normalization
-# ===============================
-def haversine_m(lat1, lon1, lat2, lon2):
-    if pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2):
-        return float("inf")
-    R = 6371000.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlbd = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dlbd/2)**2
-    return 2 * R * math.asin(math.sqrt(a))
-
-def shared_bin_steps(all_lats: np.ndarray, meters: float) -> Tuple[float, float]:
-    med_lat = float(np.nanmedian(all_lats)) if len(all_lats) else 0.0
-    deg_per_m_lat = 1.0 / 111320.0
-    deg_per_m_lon = 1.0 / (111320.0 * max(math.cos(math.radians(med_lat)), 1e-6))
-    return meters * deg_per_m_lat, meters * deg_per_m_lon
-
-def assign_bins(df: pd.DataFrame, la: Optional[str], lo: Optional[str], lat_step: float, lon_step: float):
-    if la and lo and la in df.columns and lo in df.columns:
-        lat_vals = to_float(df[la]); lon_vals = to_float(df[lo])
-        df["_lat_bin"] = np.where(lat_vals.notna(), np.floor(lat_vals / lat_step), np.nan).astype(np.float64)
-        df["_lon_bin"] = np.where(lon_vals.notna(), np.floor(lon_vals / lon_step), np.nan).astype(np.float64)
-    else:
-        df["_lat_bin"] = np.nan
-        df["_lon_bin"] = np.nan
-
 def strip_accents(s: str) -> str:
     if s is None: return ""
     s = str(s)
@@ -393,7 +258,7 @@ def map_new_to_old_schema(new_df: pd.DataFrame, old_cols_ordered: List[str]) -> 
             old_addr_col = col
             break
     if old_addr_col and new2[old_addr_col].eq("").all():
-        # find any address-like column in the original NEW
+        # prefer a direct match in NEW, otherwise first address-like candidate
         new_addr_col = find_ci(new_df, ADDR_CANDS)
         if not new_addr_col:
             new_addr_cols = find_all_ci(new_df, ADDR_CANDS)
@@ -401,17 +266,13 @@ def map_new_to_old_schema(new_df: pd.DataFrame, old_cols_ordered: List[str]) -> 
         if new_addr_col:
             new2[old_addr_col] = new_df[new_addr_col].fillna("").astype(str)
 
-    # NAME-like filling with special dba handling
+    # NAME-like special handling (filling older schema's name columns)
     old_name_cols = [c for c in old_cols_ordered if re.sub(r"[\s_]+", "", c.lower()) in {re.sub(r"[\s_]+", "", n) for n in NAME_CANDS}]
-    # find a generic new name (first best) and also list all name-like cols in new
     new_name_col_generic = find_ci(new_df, NAME_CANDS)
     new_name_cols_all = find_all_ci(new_df, NAME_CANDS)
 
     for col in old_name_cols:
-        # token for this old name column (e.g., 'dba', 'storename' -> tokens without underscores/spaces)
         old_tok = re.sub(r"[\s_]+", "", col.lower())
-
-        # If the old column is 'dba', only populate it from NEW if NEW has an explicit dba column.
         if old_tok == "dba":
             dba_in_new = None
             for nc in new_name_cols_all:
@@ -425,7 +286,6 @@ def map_new_to_old_schema(new_df: pd.DataFrame, old_cols_ordered: List[str]) -> 
                 # intentionally leave OLD.dba alone (do not populate from generic name)
                 continue
         else:
-            # If new has a column matching same token (e.g., old 'store_name' and new 'store_name'), use that
             same_token_new = None
             for nc in new_name_cols_all:
                 if re.sub(r"[\s_]+", "", nc.lower()) == old_tok:
@@ -435,7 +295,6 @@ def map_new_to_old_schema(new_df: pd.DataFrame, old_cols_ordered: List[str]) -> 
                 if col in new2 and new2[col].eq("").all():
                     new2[col] = new_df[same_token_new].fillna("").astype(str)
             else:
-                # fallback: if generic new name exists (like 'name' or 'store_name'), use it for non-dba old name cols
                 if new_name_col_generic and col in new2 and new2[col].eq("").all():
                     new2[col] = new_df[new_name_col_generic].fillna("").astype(str)
 
@@ -447,7 +306,7 @@ def map_new_to_old_schema(new_df: pd.DataFrame, old_cols_ordered: List[str]) -> 
 def compare_pair(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
     """
     Core compare logic. Inputs: old_df, new_df (pandas DataFrames).
-    Returns: DataFrame with columns: ['flag','changed_columns', ...old schema...]
+    Returns: DataFrame with columns: ['flag','changed_columns', .old schema.]
     Flags: 'matched', 'new', 'closed'
     """
     schema = list(old_df.columns)
@@ -749,14 +608,93 @@ def compare_pair(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(out_rows)
     # ensure columns exist before selecting
     selected = ["flag", "changed_columns"] + [c for c in schema if c in out.columns]
-    return out[selected]
+    out = out[selected]
+    return out
 
 # ===============================
-# Pairing across many files (by brand)
+# Batch run (optional CLI)
 # ===============================
-def list_csvs(folder: Path) -> List[Path]:
-    return sorted(folder.glob("*.csv"))
+def run_batch(save_results: bool = True):
+    """
+    Optional batch mode: reads CSVs from OLD_DIR and NEW_DIR, pairs by brand and compares.
+    If save_results is True, writes outputs to OUT_DIR using safe_write_csv.
+    """
+    old_files = list_csvs(OLD_DIR)
+    new_files = list_csvs(NEW_DIR)
+    if not old_files: raise FileNotFoundError(f"No CSVs found in {OLD_DIR}")
+    if not new_files: raise FileNotFoundError(f"No CSVs found in {NEW_DIR}")
 
+    pairs = pair_files_by_brand(old_files, new_files)
+    if not pairs:
+        print("⚠️  No brand-matched pairs found with current strategy.")
+        return
+
+    print(f"🔎 Found {len(pairs)} pair(s) ({PAIRING_STRATEGY}) by brand.")
+    results = []
+    for old_path, new_path in pairs:
+        print(f"• {extract_brand(old_path)} | OLD: {old_path.name}  ⇢  NEW: {new_path.name}")
+
+        old_df = normalize_headers(read_csv_robust(old_path))
+        new_df = normalize_headers(read_csv_robust(new_path))
+
+        out_df = compare_pair(old_df, new_df)
+        results.append((old_path, new_path, out_df))
+
+        if save_results:
+            out_path = OUT_DIR / f"{new_path.stem}_compared.csv"
+            safe_write_csv(out_df, out_path)
+
+    return results
+
+# ===============================
+# Streamlit / Upload wrappers (in-memory)
+# ===============================
+def compare_pair_df(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Public wrapper for UI. Accepts two DataFrames (old_df, new_df).
+    Performs header normalization, deduplicates NEW rows (per request),
+    and returns compared DataFrame. No file writes, purely in-memory.
+    """
+    # ensure strings to avoid dtype surprises
+    old_df = normalize_headers(old_df.copy().astype(object).where(pd.notna(old_df), ""))
+    new_df = normalize_headers(new_df.copy().astype(object).where(pd.notna(new_df), ""))
+
+    # ---- NEW: drop duplicates in NEW file based on normalized name,address,city,state,zipcode ----
+    new_df = dedupe_new_rows(new_df)
+    # ----------------------------------------------------------------------------------------
+
+    return compare_pair(old_df, new_df)
+
+
+def compare_uploaded_files(old_file, new_file) -> pd.DataFrame:
+    """
+    Wrapper for UI:
+    Accepts uploaded file-like objects (Streamlit) OR filesystem path (Path/str).
+    Returns the compared DataFrame (in-memory).
+    """
+    if hasattr(old_file, "read"):
+        old_df = pd.read_csv(old_file, dtype=str, keep_default_na=False, encoding=ENCODING)
+    else:
+        old_df = normalize_headers(read_csv_robust(Path(old_file)))
+
+    if hasattr(new_file, "read"):
+        new_df = pd.read_csv(new_file, dtype=str, keep_default_na=False, encoding=ENCODING)
+    else:
+        new_df = normalize_headers(read_csv_robust(Path(new_file)))
+
+    return compare_pair_df(old_df, new_df)
+
+def compare_files_paths(old_path: str, new_path: str) -> pd.DataFrame:
+    """
+    Simple helper to compare two filesystem CSV paths. Returns DataFrame in-memory.
+    """
+    old_df = normalize_headers(read_csv_robust(Path(old_path)))
+    new_df = normalize_headers(read_csv_robust(Path(new_path)))
+    return compare_pair_df(old_df, new_df)
+
+# ===============================
+# Helper: pair files by brand
+# ===============================
 def build_index(files: List[Path]):
     items = []
     for p in files:
@@ -813,77 +751,263 @@ def pair_files_by_brand(old_files: List[Path], new_files: List[Path]) -> List[Tu
     return dedup
 
 # ===============================
-# Batch run (optional CLI)
+# Misc helpers (IO)
 # ===============================
-def run_batch(save_results: bool = True):
+def _safe_stem(stem: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", stem)
+
+def safe_write_csv(df: pd.DataFrame, out_path: Path, encoding: str = ENCODING):
     """
-    Optional batch mode: reads CSVs from OLD_DIR and NEW_DIR, pairs by brand and compares.
-    If save_results is True, writes outputs to OUT_DIR using safe_write_csv.
+    Attempts to save CSV, with fallback names if target busy. Creates OUT_DIR if missing.
+    (This is a helper for CLI/batch usage only — UI wrappers do not call this.)
     """
-    old_files = list_csvs(OLD_DIR)
-    new_files = list_csvs(NEW_DIR)
-    if not old_files: raise FileNotFoundError(f"No CSVs found in {OLD_DIR}")
-    if not new_files: raise FileNotFoundError(f"No CSVs found in {NEW_DIR}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        df.to_csv(out_path, index=False, encoding=encoding)
+        return out_path
+    except PermissionError:
+        pass
+    except OSError:
+        spath = out_path.parent / f"{_safe_stem(out_path.stem)}{out_path.suffix}"
+        try:
+            df.to_csv(spath, index=False, encoding=encoding)
+            return spath
+        except Exception:
+            out_path = spath
 
-    pairs = pair_files_by_brand(old_files, new_files)
-    if not pairs:
-        print("⚠️  No brand-matched pairs found with current strategy.")
-        return
-
-    print(f"🔎 Found {len(pairs)} pair(s) ({PAIRING_STRATEGY}) by brand.")
-    results = []
-    for old_path, new_path in pairs:
-        print(f"• {extract_brand(old_path)} | OLD: {old_path.name}  ⇢  NEW: {new_path.name}")
-
-        old_df = normalize_headers(read_csv_robust(old_path))
-        new_df = normalize_headers(read_csv_robust(new_path))
-
-        out_df = compare_pair(old_df, new_df)
-        results.append((old_path, new_path, out_df))
-
-        if save_results:
-            out_path = OUT_DIR / f"{new_path.stem}_compared.csv"
-            safe_write_csv(out_df, out_path)
-
-    return results
+    base = _safe_stem(out_path.stem)
+    suffix = out_path.suffix
+    parent = out_path.parent
+    n = 1
+    while True:
+        candidate = parent / f"{base}_{n}{suffix}"
+        try:
+            df.to_csv(candidate, index=False, encoding=encoding)
+            return candidate
+        except (PermissionError, OSError):
+            n += 1
 
 # ===============================
-# Streamlit / Upload wrappers (in-memory)
+# Dataframe helpers (UPDATED: headers normalized to lowercase)
 # ===============================
-def compare_pair_df(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Public wrapper for UI. Accepts two DataFrames (old_df, new_df).
-    Returns compared DataFrame. No file writes, purely in-memory.
-    """
-    # ensure strings to avoid dtype surprises
-    old_df = normalize_headers(old_df.copy().astype(object).where(pd.notna(old_df), ""))
-    new_df = normalize_headers(new_df.copy().astype(object).where(pd.notna(new_df), ""))
-    return compare_pair(old_df, new_df)
 
-def compare_uploaded_files(old_file, new_file) -> pd.DataFrame:
+def _norm_name_val(v: str) -> str:
+    """Normalize name-like values for stable duplicate detection."""
+    if v is None: return ""
+    t = strip_accents(str(v)).lower().strip()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+def dedupe_new_rows(new_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Wrapper for UI:
-    Accepts uploaded file-like objects (Streamlit) OR filesystem path (Path/str).
-    Returns the compared DataFrame (in-memory).
+    Drop duplicate rows in NEW DataFrame based on normalized:
+    name-like (store_name), address (street), city, state, zipcode.
+    Works case-insensitively and uses the same normalizers already used by the engine.
+    Keeps the first occurrence.
     """
-    if hasattr(old_file, "read"):
-        old_df = pd.read_csv(old_file, dtype=str, keep_default_na=False, encoding=ENCODING)
+    if not isinstance(new_df, pd.DataFrame):
+        return new_df
+
+    # Determine which logical columns exist in the df (case-insensitive)
+    name_col = find_ci(new_df, NAME_CANDS)
+    addr_col = find_ci(new_df, ADDR_CANDS)
+    city_col = find_ci(new_df, CITY_CANDS)
+    state_col = find_ci(new_df, STATE_CANDS)
+    zip_col = find_ci(new_df, ZIP_CANDS)
+
+    # If none of the key columns exist, nothing to dedupe by
+    if not any([name_col, addr_col, city_col, state_col, zip_col]):
+        return new_df
+
+    tmp_key_cols = []
+    df = new_df.copy()
+
+    # Create normalized helper columns to build a composite key
+    if name_col:
+        df["_dup_name"] = df[name_col].apply(_norm_name_val)
+        tmp_key_cols.append("_dup_name")
+    if addr_col:
+        # use address normalizer (street-line normalized) for better dedupe
+        df["_dup_addr"] = df[addr_col].fillna("").apply(lambda x: norm_addr(x))
+        tmp_key_cols.append("_dup_addr")
+    if city_col:
+        df["_dup_city"] = df[city_col].fillna("").apply(lambda x: norm_city(x))
+        tmp_key_cols.append("_dup_city")
+    if state_col:
+        df["_dup_state"] = df[state_col].fillna("").apply(lambda x: norm_state(x))
+        tmp_key_cols.append("_dup_state")
+    if zip_col:
+        df["_dup_zip"] = df[zip_col].fillna("").apply(lambda x: norm_zip(x))
+        tmp_key_cols.append("_dup_zip")
+
+    # Build composite key (join with '|') to detect duplicates robustly
+    df["_dup_key"] = df[tmp_key_cols].agg("|".join, axis=1)
+
+    # Drop duplicates keeping first
+    before = len(df)
+    df = df.drop_duplicates(subset="_dup_key", keep="first").reset_index(drop=True)
+    after = len(df)
+
+    # Drop the temporary columns
+    df = df.drop(columns=[c for c in ["_dup_name","_dup_addr","_dup_city","_dup_state","_dup_zip","_dup_key"] if c in df.columns])
+
+    # Optionally log how many removed (only if you want to print)
+    # print(f"Deduped NEW rows: {before - after} removed.")
+
+    return df
+
+def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize DataFrame column names and basic string cells:
+    - column names -> collapsed whitespace, stripped, lowercased (case-insensitive matching everywhere)
+    - returns a copy of df with normalized columns
+    """
+    if not isinstance(df, pd.DataFrame):
+        return df
+    df = df.copy()
+    new_cols = []
+    for c in df.columns:
+        if c is None:
+            nc = ""
+        else:
+            # convert to str first, collapse whitespace, strip, then lowercase
+            nc = re.sub(r"\s+", " ", str(c)).strip().lower()
+        new_cols.append(nc)
+    df.columns = new_cols
+    return df
+
+def _token(s: str) -> str:
+    return re.sub(r"[\s_]+", "", s.lower())
+
+def find_ci(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """
+    Case-insensitive and token-insensitive column finder.
+    Also honors HEADER_ALIASES: if a candidate token has aliases, treat those as valid.
+    Returns the actual DataFrame column name if found, otherwise None.
+    Works even if df.columns are not normalized (but normalize_headers is expected to be used).
+    """
+    # direct lookups
+    low = {c.lower(): c for c in df.columns}
+    tok = {_token(c): c for c in df.columns}
+
+    # build expanded candidates including aliases
+    expanded: List[str] = []
+    for c in candidates:
+        expanded.append(c)
+        # normalized token form of candidate
+        cand_tok = re.sub(r"[\s_]+", "", c.lower())
+        # if candidate matches a canonical alias key, include its aliases
+        for canon, alias_list in HEADER_ALIASES.items():
+            if cand_tok == re.sub(r"[\s_]+", "", canon.lower()):
+                expanded.extend(alias_list)
+
+    for name in expanded:
+        nlow = name.lower()
+        if nlow in low:
+            return low[nlow]
+        ntok = _token(name)
+        if ntok in tok:
+            return tok[ntok]
+    return None
+
+def find_all_ci(df: pd.DataFrame, candidates: List[str]) -> List[str]:
+    """
+    Like find_ci but returns all matching DataFrame columns (preserving order & uniqueness).
+    Honors HEADER_ALIASES expansions.
+    """
+    found = []
+    tok_map = {_token(c): c for c in df.columns}
+    cols_lower = {c.lower(): c for c in df.columns}
+
+    # build expanded candidate list (include aliases)
+    expanded: List[str] = []
+    for cand in candidates:
+        expanded.append(cand)
+        ctok = re.sub(r"[\s_]+", "", cand.lower())
+        for canon, aliases in HEADER_ALIASES.items():
+            if ctok == re.sub(r"[\s_]+", "", canon.lower()):
+                expanded.extend(aliases)
+
+    for cand in expanded:
+        n = cand.lower()
+        if n in cols_lower:
+            # include all actual df columns that exactly match this lower form
+            for c in df.columns:
+                if c.lower() == n:
+                    found.append(c)
+        else:
+            t = re.sub(r"[\s_]+", "", cand.lower())
+            if t in tok_map:
+                found.append(tok_map[t])
+
+    # keep order and unique
+    seen = set(); out = []
+    for c in found:
+        if c not in seen:
+            out.append(c); seen.add(c)
+    return out
+
+
+def detect_lat_lon_optional(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return the actual column names for latitude and longitude if present (or None).
+    Works case-insensitively and recognizes common synonyms: lat, latitude, lon, lng, long.
+    """
+    if "latitude" in (c.lower() for c in df.columns) and "longitude" in (c.lower() for c in df.columns):
+        # find actual column names that match lowercase tokens
+        low = {c.lower(): c for c in df.columns}
+        return low.get("latitude"), low.get("longitude")
+    low = {c.lower(): c for c in df.columns}
+    lat = low.get("latitude") or low.get("lat")
+    lon = low.get("longitude") or low.get("lon") or low.get("lng") or low.get("long")
+    return lat, lon
+
+def to_float(s):
+    return pd.to_numeric(s, errors="coerce")
+
+# ===============================
+# Phone normalization & compare
+# ===============================
+def norm_phone(s: str) -> str:
+    if s is None: return ""
+    return re.sub(r"\D", "", str(s))
+
+def phone_matches(a: str, b: str) -> bool:
+    d1, d2 = norm_phone(a), norm_phone(b)
+    if not d1 or not d2: return False
+    if d1 == d2: return True
+    return len(d1) >= 7 and len(d2) >= 7 and d1[-7:] == d2[-7:]
+
+# ===============================
+# Geo + Text normalization
+# ===============================
+def haversine_m(lat1, lon1, lat2, lon2):
+    if pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2):
+        return float("inf")
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlbd = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dlbd/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
+
+def shared_bin_steps(all_lats: np.ndarray, meters: float) -> Tuple[float, float]:
+    med_lat = float(np.nanmedian(all_lats)) if len(all_lats) else 0.0
+    deg_per_m_lat = 1.0 / 111320.0
+    deg_per_m_lon = 1.0 / (111320.0 * max(math.cos(math.radians(med_lat)), 1e-6))
+    return meters * deg_per_m_lat, meters * deg_per_m_lon
+
+def assign_bins(df: pd.DataFrame, la: Optional[str], lo: Optional[str], lat_step: float, lon_step: float):
+    if la and lo and la in df.columns and lo in df.columns:
+        lat_vals = to_float(df[la]).to_numpy()
+        lon_vals = to_float(df[lo]).to_numpy()
+        # guard shape
+        if lat_vals.size and lon_vals.size:
+            df["_lat_bin"] = np.floor(lat_vals / lat_step).astype(np.int64)
+            df["_lon_bin"] = np.floor(lon_vals / lon_step).astype(np.int64)
+        else:
+            df["_lat_bin"] = np.nan
+            df["_lon_bin"] = np.nan
     else:
-        old_df = normalize_headers(read_csv_robust(Path(old_file)))
-
-    if hasattr(new_file, "read"):
-        new_df = pd.read_csv(new_file, dtype=str, keep_default_na=False, encoding=ENCODING)
-    else:
-        new_df = normalize_headers(read_csv_robust(Path(new_file)))
-
-    return compare_pair_df(old_df, new_df)
-
-def compare_files_paths(old_path: str, new_path: str) -> pd.DataFrame:
-    """
-    Simple helper to compare two filesystem CSV paths. Returns DataFrame in-memory.
-    """
-    old_df = normalize_headers(read_csv_robust(Path(old_path)))
-    new_df = normalize_headers(read_csv_robust(Path(new_path)))
-    return compare_pair_df(old_df, new_df)
-
-# End of module - nothing executes on import.
+        df["_lat_bin"] = np.nan
+        df["_lon_bin"] = np.nan

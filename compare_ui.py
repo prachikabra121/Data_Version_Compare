@@ -1,31 +1,74 @@
-# streamlit_app.py
+# compare_ui.py
 import io
 import os
+import time
+import numpy as np
 import pandas as pd
 import streamlit as st
 import compare_engine
-import time
 
+# ======================================================
+# Streamlit Page Settings
+# ======================================================
 st.set_page_config(
-    page_title="OLD vs NEW CSV Comparator",
+    page_title="VERSION COMPARE TOOL",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🔁 OLD vs NEW CSV Comparator")
+st.title("🔁 Version Compare Tool")
 st.markdown(
     "Upload your OLD CSV and NEW CSV files. "
-    "The system will compare them in-memory using fuzzy address + store ID logic. "
+    "The system compares in-memory using fuzzy address + store ID logic. "
     "**No files are stored on disk.**"
 )
 
-# Sidebar options
+# ======================================================
+# Arrow-Safe DataFrame Sanitizer (IMPORTANT FIX)
+# ======================================================
+def sanitize_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prevent Streamlit ArrowTypeError:
+    - Convert lat/lon to float
+    - Convert mixed-type columns to strings
+    - Replace NaN with None
+    """
+    df = df.copy()
+
+    lower = {c.lower(): c for c in df.columns}
+
+    # Fix latitude
+    for lat_tok in ("latitude", "lat"):
+        if lat_tok in lower:
+            col = lower[lat_tok]
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Fix longitude
+    for lon_tok in ("longitude", "lon", "lng", "long"):
+        if lon_tok in lower:
+            col = lower[lon_tok]
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Fix mixed-type columns
+    for col in df.columns:
+        if df[col].dtype == object:
+            if df[col].apply(lambda x: isinstance(x, (float, int, np.floating, np.integer))).any():
+                df[col] = df[col].astype(str).replace({"nan": None, "None": None})
+            else:
+                df[col] = df[col].astype(str).replace({"nan": None, "None": None})
+
+    df = df.where(pd.notnull(df), None)
+    return df
+
+
+# ======================================================
+# Sidebar (Matching Options)
+# ======================================================
 with st.sidebar:
     st.header("⚙️ Matching Options")
     compare_engine.PAIRING_STRATEGY = st.selectbox(
         "Pairing strategy",
-        ["closest-prev", "same-date"],
-        help="closest-prev = latest older old-file for each new, same-date = same date token"
+        ["closest-prev", "same-date"]
     )
     compare_engine.MAX_METERS = st.number_input("Geo tolerance (meters)", 0, 5000, compare_engine.MAX_METERS, 50)
     compare_engine.ADDR_STRICT = st.slider("Address strict threshold", 0.5, 1.0, compare_engine.ADDR_STRICT, 0.01)
@@ -33,123 +76,152 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption("Data stays only in-memory — refresh clears all.")
-    st.caption("Large CSVs show live progress indicators.")
 
-# Upload files
+
+# ======================================================
+# Upload Files
+# ======================================================
 col1, col2 = st.columns(2)
 with col1:
     st.subheader("OLD CSV File")
     old_file = st.file_uploader("Upload OLD file", type=["csv"], key="old_file")
+
 with col2:
     st.subheader("NEW CSV File")
     new_file = st.file_uploader("Upload NEW file", type=["csv"], key="new_file")
 
-run_compare = st.button("🔍 Compare Files", disabled=(old_file is None or new_file is None))
+run_compare = st.button("🔍 Compare Files", disabled=(not old_file or not new_file))
 
-# ============ Progress helper ============
-def show_file_read_progress(upload_file, label):
-    progress = st.progress(0, text=f"Reading {label} ...")
+
+# ======================================================
+# Chunked File Reader with Progress Bar
+# ======================================================
+def read_with_progress(upload_file, label):
+    progress = st.progress(0, text=f"Reading {label}...")
     size = upload_file.size
     buffer = io.BytesIO()
+
     chunk = 1024 * 512
     bytes_read = 0
+
+    t0 = time.perf_counter()
     upload_file.seek(0)
+
     while True:
-        chunk_data = upload_file.read(chunk)
-        if not chunk_data:
+        data = upload_file.read(chunk)
+        if not data:
             break
-        buffer.write(chunk_data)
-        bytes_read += len(chunk_data)
-        progress.progress(min(int(bytes_read / size * 100), 100), text=f"Reading {label} ({bytes_read/1e6:.1f} MB / {size/1e6:.1f} MB)")
+        buffer.write(data)
+        bytes_read += len(data)
+
+        pct = min(int((bytes_read / size) * 100), 100)
+        progress.progress(pct, text=f"{label} ({bytes_read/1e6:.2f} MB / {size/1e6:.2f} MB)")
+
     buffer.seek(0)
-    progress.progress(100, text=f"{label} loaded ✅")
-    time.sleep(0.2)
-    return buffer
+    t1 = time.perf_counter()
+    progress.progress(100, text=f"{label} loaded!")
 
-def run_comparison_with_progress(old_buffer, new_buffer):
-    """
-    Run compare_engine.compare_uploaded_files but show progress updates
-    for major phases (loading, matching, final merge).
-    """
-    status = st.status("Running comparison...", expanded=True)
+    return buffer, (t1 - t0)
+
+
+# ======================================================
+# Perform Comparison With Progress + Timing
+# ======================================================
+def run_comparison(old_buf, new_buf):
+    status = st.empty()
     progress = st.progress(0)
+
+    timings = dict(t_total=0, t_old=0, t_new=0, t_clean=0, t_compare=0)
+    t_all0 = time.perf_counter()
+
     try:
-        status.write("📄 Loading OLD file into DataFrame...")
-        old_df = pd.read_csv(old_buffer, dtype=str, keep_default_na=False, encoding=compare_engine.ENCODING)
-        progress.progress(10)
-        status.write(f"✅ OLD file loaded ({len(old_df):,} rows)")
+        # Load OLD
+        status.info("📄 Loading OLD...")
+        t0 = time.perf_counter()
+        old_df = pd.read_csv(old_buf, dtype=str, keep_default_na=False)
+        t1 = time.perf_counter()
+        timings["t_old"] = t1 - t0
+        progress.progress(15)
 
-        status.write("📄 Loading NEW file into DataFrame...")
-        new_df = pd.read_csv(new_buffer, dtype=str, keep_default_na=False, encoding=compare_engine.ENCODING)
-        progress.progress(20)
-        status.write(f"✅ NEW file loaded ({len(new_df):,} rows)")
+        # Load NEW
+        status.info("📄 Loading NEW...")
+        t0 = time.perf_counter()
+        new_df = pd.read_csv(new_buf, dtype=str, keep_default_na=False)
+        t1 = time.perf_counter()
+        timings["t_new"] = t1 - t0
+        progress.progress(30)
 
-        total_steps = len(old_df)
-        step = max(1, total_steps // 50)
+        # Preprocess + dedupe
+        status.info("🧹 Cleaning + normalizing + deduping NEW...")
+        t0 = time.perf_counter()
+        old_df = compare_engine.normalize_headers(old_df)
+        new_df = compare_engine.normalize_headers(new_df)
+        if hasattr(compare_engine, "dedupe_new_rows"):
+            new_df = compare_engine.dedupe_new_rows(new_df)
+        t1 = time.perf_counter()
+        timings["t_clean"] = t1 - t0
+        progress.progress(45)
 
-        # Monkey-patch progress updates inside compare loop
-        result_df = None
-
-        def monitored_compare(old_df, new_df):
-            # emulate per-row progress for big files
-            chunk_size = max(1, len(old_df) // 100)
-            last_update = 0
-            for idx, _ in enumerate(old_df.itertuples(index=False), 1):
-                if idx % chunk_size == 0:
-                    yield idx / len(old_df)
-            yield 1.0  # final
-
-        status.write("🔎 Matching locations...")
-        for prog in monitored_compare(old_df, new_df):
-            progress.progress(int(20 + 70 * prog))
-            time.sleep(0.02)
-
-        result_df = compare_engine.compare_pair_df(old_df, new_df)
+        # Compare
+        status.info("🔎 Comparing...")
+        t0 = time.perf_counter()
+        result = compare_engine.compare_pair_df(old_df, new_df)
+        t1 = time.perf_counter()
+        timings["t_compare"] = t1 - t0
         progress.progress(95)
-        status.write("✅ Comparison logic complete. Generating output...")
 
-        time.sleep(0.2)
+        timings["t_total"] = time.perf_counter() - t_all0
         progress.progress(100)
-        status.update(label="✅ Comparison completed successfully!", state="complete", expanded=False)
-        return result_df
+        status.success("Done!")
+
+        return result, timings
 
     except Exception as e:
-        status.update(label="❌ Comparison failed", state="error", expanded=True)
+        status.error("Error in comparison")
         st.exception(e)
-        return None
+        return None, timings
 
-# ============ Run comparison ============
+
+# ======================================================
+# Execute Comparison
+# ======================================================
 if run_compare:
-    if old_file is None or new_file is None:
-        st.warning("Please upload both OLD and NEW files first.")
-    else:
-        # Read files with progress
-        old_buf = show_file_read_progress(old_file, "OLD CSV")
-        new_buf = show_file_read_progress(new_file, "NEW CSV")
 
-        result_df = run_comparison_with_progress(old_buf, new_buf)
+    old_buf, t_old = read_with_progress(old_file, "OLD CSV")
+    new_buf, t_new = read_with_progress(new_file, "NEW CSV")
 
-        if result_df is not None:
-            st.success(f"✅ Comparison completed successfully with {len(result_df):,} rows.")
-            st.markdown("### 🔍 Result Preview (first 500 rows)")
-            st.dataframe(result_df.head(500))
+    result_df, timings = run_comparison(old_buf, new_buf)
 
-            csv_bytes = result_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            st.download_button(
-                "⬇️ Download Full Result CSV",
-                data=csv_bytes,
-                file_name="comparison_result.csv",
-                mime="text/csv",
-            )
+    if result_df is not None:
+        st.success(f"Comparison completed – {len(result_df):,} rows")
 
-            if "changed_columns" in result_df.columns:
-                changed = result_df[result_df["changed_columns"].astype(str).str.strip() != ""]
-                st.markdown(f"### ✏️ Changed Rows: {len(changed):,}")
-                if len(changed) > 0:
-                    st.dataframe(changed.head(200))
-                    st.download_button(
-                        "⬇️ Download Changed Rows CSV",
-                        changed.to_csv(index=False, encoding="utf-8-sig"),
-                        file_name="comparison_changed_rows.csv",
-                        mime="text/csv",
-                    )
+        # Timings Box
+        st.markdown("### ⏱️ Timing Summary")
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric("OLD Read (s)", f"{timings['t_old']:.2f}")
+        c2.metric("NEW Read (s)", f"{timings['t_new']:.2f}")
+        c3.metric("Preprocess (s)", f"{timings['t_clean']:.2f}")
+        c4.metric("Compare (s)", f"{timings['t_compare']:.2f}")
+
+        st.info(f"**Total Time:** {timings['t_total']:.2f} seconds")
+
+        # Fix DataFrame for Streamlit
+        safe_df = sanitize_df_for_streamlit(result_df)
+
+        # Show preview
+        st.markdown("### 🔍 Preview (first 500 rows)")
+        st.dataframe(safe_df.head(500))
+
+        # Download file name = NEW FILE NAME + _compared.csv
+        base = os.path.splitext(new_file.name)[0]
+        final_name = f"{base}_compared.csv"
+
+        csv_bytes = safe_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+        st.download_button(
+            "⬇️ Download Full Result CSV",
+            data=csv_bytes,
+            file_name=final_name,
+            mime="text/csv",
+        )
